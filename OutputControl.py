@@ -1,28 +1,85 @@
 import sys
 import ctypes
+import os
+import configparser
 from ctypes import POINTER, byref, c_void_p, c_ulong, c_int, c_wchar_p, c_uint
 
 # --- PyQt5 Imports ---
 from PyQt5.QtWidgets import (QApplication, QSystemTrayIcon, QMenu,
                              QAction, QSlider, QWidget, QVBoxLayout, QLabel, QHBoxLayout,
-                             QDesktopWidget, QRadioButton, QButtonGroup, QMessageBox, QAbstractButton)
-from PyQt5.QtGui import QIcon, QPixmap, QPalette, QColor, QPainter # Added QPalette, QColor, QPainter
-from PyQt5.QtCore import Qt, QPoint, QEvent, QSize, QTimer, QByteArray # Added QByteArray
-from PyQt5.QtSvg import QSvgRenderer # Added QSvgRenderer for SVG icons
+                             QDesktopWidget, QRadioButton, QButtonGroup, QMessageBox, QAbstractButton,
+                             QPushButton, QSizePolicy, QSpacerItem, QFrame, QActionGroup, QStyle) # QStyle imported
+from PyQt5.QtGui import QIcon, QPixmap, QPalette, QColor
+from PyQt5.QtCore import Qt, QPoint, QEvent, QSize, QTimer, pyqtSignal
+
+# Added for cursor position
+from PyQt5.QtGui import QCursor
+
+# --- Base path for bundled resources (for PyInstaller/py2exe) ---
+if hasattr(sys, '_MEIPASS'):
+    base_path = sys._MEIPASS
+else:
+    base_path = os.path.abspath(".")
+
+# --- Configuration File Management ---
+CONFIG_FILE = os.path.join(base_path, 'config.ini')
+
+def load_config():
+    config = configparser.ConfigParser()
+    config.read(CONFIG_FILE)
+    
+    settings = {
+        'toggle': True, # Default: widget enabled
+        'monitor': 1,    # Default: monitor 1
+        'icon_x': 0,     # Default: icon X position
+        'icon_y': 0      # Default: icon Y position
+    }
+
+    if 'WidgetDisplay' in config:
+        if 'toggle' in config['WidgetDisplay']:
+            settings['toggle'] = config['WidgetDisplay'].getboolean('toggle')
+        if 'monitor' in config['WidgetDisplay']:
+            try:
+                settings['monitor'] = config['WidgetDisplay'].getint('monitor')
+            except ValueError:
+                pass 
+        if 'icon_x' in config['WidgetDisplay']:
+            try:
+                settings['icon_x'] = config['WidgetDisplay'].getint('icon_x')
+            except ValueError:
+                pass
+        if 'icon_y' in config['WidgetDisplay']:
+            try:
+                settings['icon_y'] = config['WidgetDisplay'].getint('icon_y')
+            except ValueError:
+                pass
+    return settings
+
+def save_config(toggle_state, monitor_index, icon_x, icon_y):
+    config = configparser.ConfigParser()
+    config['WidgetDisplay'] = {
+        'toggle': str(toggle_state),
+        'monitor': str(monitor_index),
+        'icon_x': str(icon_x),
+        'icon_y': str(icon_y)
+    }
+    with open(CONFIG_FILE, 'w') as configfile:
+        config.write(configfile)
 
 # ============================================================
-# Constants and Definitions (Copied directly from your provided project, with one critical change)
+# Constants and Definitions
 # ============================================================
 
 # COM and context constants
-COINIT_APARTMENTTHREADED = 0x2 # CRITICAL FIX: Changed to STA for GUI applications
+COINIT_APARTMENTTHREADED = 0x2
 CLSCTX_ALL = 23
 
 # Device selection enumerations (from mmdeviceapi.h)
-EDataFlow_eRender = 0    # Render devices (e.g., speakers)
-ERole_eConsole          = 0    # Console role
-ERole_eMultimedia       = 1    # Multimedia role
-ERole_eCommunications   = 2    # Communications role
+EDataFlow_eRender = 0
+EDataFlow_eCapture = 1 # Added for input devices
+ERole_eConsole          = 0
+ERole_eMultimedia       = 1
+ERole_eCommunications   = 2
 
 # Device state mask
 DEVICE_STATE_ACTIVE = 0x00000001
@@ -130,20 +187,23 @@ class IMMDeviceEnumeratorVTable(ctypes.Structure):
 class IMMDeviceEnumerator_Interface(ctypes.Structure):
     _fields_ = [("lpVtbl", POINTER(IMMDeviceEnumeratorVTable))]
 
-def get_default_endpoint(enumerator_ptr):
+def get_default_endpoint(enumerator_ptr, data_flow: int, role: int):
     """
     Uses the IMMDeviceEnumerator interface to obtain the default audio endpoint.
+    data_flow: EDataFlow_eRender (output) or EDataFlow_eCapture (input)
+    role: ERole_eConsole, ERole_eMultimedia, ERole_eCommunications
     """
     enumerator_iface = ctypes.cast(enumerator_ptr, POINTER(IMMDeviceEnumerator_Interface))
     default_endpoint = c_void_p()
     hr = enumerator_iface.contents.lpVtbl.contents.GetDefaultAudioEndpoint(
         enumerator_iface,
-        EDataFlow_eRender,
-        ERole_eConsole,
+        data_flow,
+        role,
         byref(default_endpoint)
     )
     if hr < 0:
-        raise ctypes.WinError(hr)
+        # print(f"GetDefaultAudioEndpoint failed for data_flow={data_flow}, role={role}: {ctypes.WinError(hr)}")
+        return None # Return None if no default endpoint found or error
     return default_endpoint
 
 # ============================================================
@@ -261,7 +321,6 @@ def get_master_volume_scalar(audio_volume_ptr) -> float:
 
 def set_master_volume_scalar(audio_volume_ptr, value: float):
     volume_iface = ctypes.cast(audio_volume_ptr, POINTER(IAudioEndpointVolume_Interface))
-    # FIX: Re-added 'volume_iface' as the first argument
     hr = volume_iface.contents.lpVtbl.contents.SetMasterVolumeLevelScalar(volume_iface, ctypes.c_float(value), None)
     if hr < 0:
         raise ctypes.WinError(hr)
@@ -284,9 +343,8 @@ class IPropertyStore_Interface(ctypes.Structure):
 
 # Helper to release COM objects (defined once at the top)
 def release_com_object(ptr):
-    if ptr and ptr.value: # Check if pointer is not null
+    if ptr and ptr.value:
         try:
-            # All COM interfaces inherit from IUnknown, and Release is at VTable index 2
             class IUnknownVTable(ctypes.Structure):
                 _fields_ = [
                     ("QueryInterface", ctypes.WINFUNCTYPE(ctypes.c_long, c_void_p, POINTER(GUID), POINTER(c_void_p))),
@@ -306,7 +364,7 @@ def get_device_friendly_name(device_ptr):
     """
     Opens the property store for the device and retrieves the friendly name.
     """
-    pPropertyStore = None # Initialize to None
+    pPropertyStore = None
     try:
         device_iface = ctypes.cast(device_ptr, POINTER(IMMDevice_Interface))
         pPropertyStore = c_void_p()
@@ -320,7 +378,7 @@ def get_device_friendly_name(device_ptr):
             raise ctypes.WinError(hr)
         return propvar.pwszVal
     finally:
-        release_com_object(pPropertyStore) # Release the property store pointer
+        release_com_object(pPropertyStore)
 
 # ============================================================
 # IMMDeviceCollection Interface (for Enumerating Devices)
@@ -338,50 +396,53 @@ class IMMDeviceCollection_Interface(ctypes.Structure):
     _fields_ = [("lpVtbl", POINTER(IMMDeviceCollectionVTable))]
 
 
-def enumerate_audio_endpoints(enumerator_ptr):
+def enumerate_audio_endpoints(enumerator_ptr, data_flow: int):
     """
-    Enumerates all active render devices and returns a list of dictionaries:
+    Enumerates all active audio endpoints for a given data flow (render/capture)
+    and returns a list of dictionaries:
     {'ptr': device pointer, 'name': friendly name, 'id': device ID string}
     """
-    pCollection = None # Initialize to None
+    pCollection = None
     devices = []
     try:
         enumerator_iface = ctypes.cast(enumerator_ptr, POINTER(IMMDeviceEnumerator_Interface))
         pCollection = c_void_p()
         hr = enumerator_iface.contents.lpVtbl.contents.EnumAudioEndpoints(
             enumerator_iface,
-            EDataFlow_eRender,
+            data_flow,
             DEVICE_STATE_ACTIVE,
             byref(pCollection)
         )
         if hr < 0:
-            raise ctypes.WinError(hr)
+            # print(f"EnumAudioEndpoints failed for data_flow={data_flow}: {ctypes.WinError(hr)}")
+            return [] # Return empty list if no devices found or error
+        
         collection_iface = ctypes.cast(pCollection, POINTER(IMMDeviceCollection_Interface))
         count = c_uint()
         hr = collection_iface.contents.lpVtbl.contents.GetCount(collection_iface, byref(count))
         if hr < 0:
-            raise ctypes.WinError(hr)
+            # print(f"GetCount failed for data_flow={data_flow}: {ctypes.WinError(hr)}")
+            return []
         
         for i in range(count.value):
-            pDevice = None # Initialize to None for each iteration
+            pDevice = None
             try:
                 pDevice = c_void_p()
                 hr = collection_iface.contents.lpVtbl.contents.Item(collection_iface, i, byref(pDevice))
                 if hr < 0:
-                    continue # Skip this device if Item fails
+                    continue
                 
-                name = get_device_friendly_name(pDevice) # This function now releases pPropertyStore
+                name = get_device_friendly_name(pDevice)
                 device_id = get_device_id(pDevice)
                 devices.append({"ptr": pDevice, "name": name, "id": device_id})
-                # IMPORTANT: pDevice is added to the list. It should NOT be released here,
-                # as it's passed to the UI and will be used later.
-                # Its Release will be handled by the UI elements if they store it,
-                # or when the app exits.
             except Exception as e:
-                release_com_object(pDevice) # Release if an error occurred before adding to list
-                pass # Skip devices that cause errors
+                # print(f"Error processing device {i} for data_flow={data_flow}: {e}")
+                release_com_object(pDevice)
+                pass
     finally:
-        release_com_object(pCollection) # Release the collection pointer
+        release_com_object(pCollection)
+    
+    devices.reverse() # Often preferred for display order
     return devices
 
 # ============================================================
@@ -412,9 +473,9 @@ class IPolicyConfig_Interface(ctypes.Structure):
 CLSID_CPolicyConfigVistaClient = create_guid("294935CE-F637-4E7C-A41B-AB255460B862")
 IID_IPolicyConfigVista = create_guid("568B9108-44BF-40B4-9006-86AFE5B5A620")
 
-def switch_default_device(device_ptr):
+def switch_default_device(device_ptr, data_flow: int):
     """
-    Switches the default audio endpoint to the given device.
+    Switches the default audio endpoint to the given device for specific roles.
     Uses the reverse-engineered IPolicyConfigVista interface.
     Attempts to set the default endpoint for eConsole, eMultimedia, and eCommunications roles.
     If a call fails with "The tag is invalid" (error -2147023163), it logs a warning and continues.
@@ -436,23 +497,30 @@ def switch_default_device(device_ptr):
 
         policy_config = ctypes.cast(pPolicyConfig, POINTER(IPolicyConfig_Interface))
         
-        roles = [ERole_eConsole, ERole_eMultimedia, ERole_eCommunications]
+        # Roles to set based on data_flow
+        roles_to_set = []
+        if data_flow == EDataFlow_eRender:
+            roles_to_set = [ERole_eConsole, ERole_eMultimedia, ERole_eCommunications]
+        elif data_flow == EDataFlow_eCapture:
+            roles_to_set = [ERole_eConsole, ERole_eMultimedia, ERole_eCommunications] # Apply to all roles for consistency
+
         success_count = 0
-        for role in roles:
+        for role in roles_to_set:
             hr = policy_config.contents.lpVtbl.contents.SetDefaultEndpoint(policy_config, device_id, role)
             if hr < 0:
                 if hr == -2147023163:
+                    # print(f"SetDefaultEndpoint for role {role} failed with 'The tag is invalid' (expected for some roles/devices).")
                     pass
                 else:
-                    print(f"SetDefaultEndpoint for role {role} failed with unexpected error: {ctypes.WinError(hr)}")
+                    print(f"SetDefaultEndpoint for data_flow={data_flow}, role {role} failed with unexpected error: {ctypes.WinError(hr)}")
             else:
                 success_count += 1
         
         if success_count > 0:
-            print(f"Default device switched to: '{device_id}' for {success_count} roles.")
+            print(f"Default device switched to: '{device_id}' for {success_count} roles (DataFlow: {data_flow}).")
             return True
         else:
-            print(f"Failed to set default device '{device_id}' for any role.")
+            print(f"Failed to set default device '{device_id}' for any role (DataFlow: {data_flow}).")
             return False
     except Exception as e:
         print(f"Error in switch_default_device: {e}")
@@ -465,59 +533,121 @@ def switch_default_device(device_ptr):
 # PyQt5 Application (Modified to use ctypes functions)
 # ============================================================
 
-# SVG for a headphone icon
-SVG_HEADPHONE_ICON = """
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor">
-  <path d="M12 1a9 9 0 0 0-9 9v7c0 1.65 1.35 3 3 3h3v-8H5v-2a7 7 0 0 1 7-7zm0 18a7 7 0 0 1 7-7v-2h-4v8h3c1.65 0 3-1.35 3-3v-7a9 9 0 0 0-9-9z"/>
-</svg>
-"""
+def get_icon(icon_type, size=QSize(20, 20), widget_style=None):
+    """
+    Creates a QIcon based on type using QStyle.StandardPixmap.
+    """
+    if not widget_style:
+        # Fallback to application style if no widget_style is provided
+        widget_style = QApplication.instance().style()
 
-def create_svg_icon(svg_string, size=QSize(20, 20)):
-    """Creates a QIcon from an SVG string."""
-    renderer = QSvgRenderer(QByteArray(svg_string.encode('utf-8')))
-    pixmap = QPixmap(size)
-    pixmap.fill(Qt.transparent)
-    painter = QPainter(pixmap)
-    renderer.render(painter)
-    painter.end()
-    return QIcon(pixmap)
+    if icon_type == "mute":
+        return widget_style.standardIcon(QStyle.SP_MediaVolumeMuted)
+    elif icon_type == "unmute":
+        return widget_style.standardIcon(QStyle.SP_MediaVolume)
+    elif icon_type == "headphone":
+        # Using SP_MediaVolume as a general audio output icon
+        return widget_style.standardIcon(QStyle.SP_MediaVolume)
+    elif icon_type == "microphone":
+        # Using SP_MediaVolumeMuted as a general audio input icon (or to differentiate)
+        return widget_style.standardIcon(QStyle.SP_MediaPlay)
+    else:
+        return QIcon() # Return empty icon for unknown type
 
 
-class VolumeControlApp(QWidget):
-    def __init__(self, enumerator_ptr, initial_default_endpoint_ptr):
+class FloatingVolumeWidget(QWidget):
+    def __init__(self, enumerator_ptr):
         super().__init__()
 
         self.enumerator_ptr = enumerator_ptr
-        self.current_audio_volume_ptr = None
+        self.current_output_audio_volume_ptr = None
+        self.current_input_audio_volume_ptr = None
 
         self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
         self.setWindowTitle("Volume Control")
 
         main_layout = QVBoxLayout()
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        main_layout.setSpacing(10)
 
-        # Volume Slider and Label
-        slider_layout = QHBoxLayout()
-        self.volume_slider = QSlider(Qt.Horizontal)
-        self.volume_slider.setRange(0, 100)
-        
-        self.volume_slider.setValue(0) 
-        self.volume_slider.valueChanged.connect(self.set_system_volume_qt)
-        
-        self.volume_label = QLabel(f"0%")
-        self.volume_label.setAlignment(Qt.AlignCenter)
-        slider_layout.addWidget(self.volume_slider)
-        slider_layout.addWidget(self.volume_label)
-        main_layout.addLayout(slider_layout)
-        
-        main_layout.addSpacing(10)
-        main_layout.addWidget(QLabel("Output Devices:"))
+        # --- Output Devices Section ---
+        output_group_box = QFrame(self)
+        output_group_box.setFrameShape(QFrame.StyledPanel)
+        output_group_box.setFrameShadow(QFrame.Raised)
+        output_group_box_layout = QVBoxLayout(output_group_box)
+        output_group_box_layout.setContentsMargins(5, 5, 5, 5)
+        output_group_box_layout.setSpacing(5)
 
-        self.device_layout = QVBoxLayout()
-        self.device_button_group = QButtonGroup(self)
-        self.device_button_group.setExclusive(True)
-        self.device_button_group.buttonToggled.connect(self.change_audio_output_qt)
+        output_group_box_layout.addWidget(QLabel("<b>Output Devices:</b>"))
 
-        main_layout.addLayout(self.device_layout)
+        # Output Volume Slider and Label
+        output_slider_layout = QHBoxLayout()
+        self.output_volume_slider = QSlider(Qt.Horizontal)
+        self.output_volume_slider.setRange(0, 100)
+        self.output_volume_slider.setValue(0) 
+        self.output_volume_slider.valueChanged.connect(self.set_system_output_volume_qt)
+        self.output_volume_label = QLabel(f"0%")
+        self.output_volume_label.setAlignment(Qt.AlignCenter)
+        output_slider_layout.addWidget(self.output_volume_slider)
+        output_slider_layout.addWidget(self.output_volume_label)
+        output_group_box_layout.addLayout(output_slider_layout)
+        
+        # Output Mute Button
+        self.output_mute_button = QPushButton("Mute Output")
+        self.output_mute_button.setIcon(get_icon("unmute", widget_style=self.style()))
+        self.output_mute_button.setCheckable(True)
+        self.output_mute_button.setChecked(False) # Assume not muted initially
+        self.output_mute_button.toggled.connect(self.toggle_output_mute_qt)
+        output_group_box_layout.addWidget(self.output_mute_button)
+
+
+        self.output_device_layout = QVBoxLayout()
+        self.output_device_button_group = QButtonGroup(self)
+        self.output_device_button_group.setExclusive(True)
+        self.output_device_button_group.buttonToggled.connect(self.change_audio_output_qt)
+        output_group_box_layout.addLayout(self.output_device_layout)
+        output_group_box_layout.addSpacerItem(QSpacerItem(20, 0, QSizePolicy.Minimum, QSizePolicy.Expanding)) # Spacer
+
+        main_layout.addWidget(output_group_box)
+
+        # --- Input Devices Section ---
+        input_group_box = QFrame(self)
+        input_group_box.setFrameShape(QFrame.StyledPanel)
+        input_group_box.setFrameShadow(QFrame.Raised)
+        input_group_box_layout = QVBoxLayout(input_group_box)
+        input_group_box_layout.setContentsMargins(5, 5, 5, 5)
+        input_group_box_layout.setSpacing(5)
+
+        input_group_box_layout.addWidget(QLabel("<b>Input Devices:</b>"))
+
+        # Input Volume Slider and Label
+        input_slider_layout = QHBoxLayout()
+        self.input_volume_slider = QSlider(Qt.Horizontal)
+        self.input_volume_slider.setRange(0, 100)
+        self.input_volume_slider.setValue(0) 
+        self.input_volume_slider.valueChanged.connect(self.set_system_input_volume_qt)
+        self.input_volume_label = QLabel(f"0%")
+        self.input_volume_label.setAlignment(Qt.AlignCenter)
+        input_slider_layout.addWidget(self.input_volume_slider)
+        input_slider_layout.addWidget(self.input_volume_label)
+        input_group_box_layout.addLayout(input_slider_layout)
+
+        # Input Mute Button
+        self.input_mute_button = QPushButton("Mute Input")
+        self.input_mute_button.setIcon(get_icon("unmute", widget_style=self.style()))
+        self.input_mute_button.setCheckable(True)
+        self.input_mute_button.setChecked(False) # Assume not muted initially
+        self.input_mute_button.toggled.connect(self.toggle_input_mute_qt)
+        input_group_box_layout.addWidget(self.input_mute_button)
+
+        self.input_device_layout = QVBoxLayout()
+        self.input_device_button_group = QButtonGroup(self)
+        self.input_device_button_group.setExclusive(True)
+        self.input_device_button_group.buttonToggled.connect(self.change_audio_input_qt)
+        input_group_box_layout.addLayout(self.input_device_layout)
+        input_group_box_layout.addSpacerItem(QSpacerItem(20, 0, QSizePolicy.Minimum, QSizePolicy.Expanding)) # Spacer
+
+        main_layout.addWidget(input_group_box)
 
         self.setLayout(main_layout)
         self.installEventFilter(self)
@@ -528,131 +658,332 @@ class VolumeControlApp(QWidget):
         self.refresh_timer.start(1000)
 
         # Initial population on startup
-        self.populate_devices_qt()
-        self.update_volume_from_system_qt()
+        self.refresh_ui() # Call refresh_ui once to populate everything
 
     def refresh_ui(self):
-        """Refreshes both device list and volume status."""
-        self.populate_devices_qt()
-        self.update_volume_from_system_qt()
+        """Refreshes both output and input device lists and volume statuses."""
+        self.populate_output_devices_qt()
+        self.update_output_volume_from_system_qt()
+        self.populate_input_devices_qt()
+        self.update_input_volume_from_system_qt()
+        self.adjustSize() # Adjust widget size after populating devices
 
-    def set_system_volume_qt(self, value: int):
-        """Sets system master volume from slider value (0-100)."""
-        if self.current_audio_volume_ptr:
-            set_master_volume_scalar(self.current_audio_volume_ptr, value / 100.0)
-            self.volume_label.setText(f"{value}%")
+    # --- Output Device Control ---
+    def set_system_output_volume_qt(self, value: int):
+        """Sets system master volume for output from slider value (0-100)."""
+        if self.current_output_audio_volume_ptr:
+            set_master_volume_scalar(self.current_output_audio_volume_ptr, value / 100.0)
+            self.output_volume_label.setText(f"{value}%")
 
-    def update_volume_from_system_qt(self):
-        """Updates the slider and label from actual system volume of the current default device."""
+    def update_output_volume_from_system_qt(self):
+        """Updates the output slider and label from actual system volume of the current default output device."""
         default_endpoint_ptr = None
         try:
-            default_endpoint_ptr = get_default_endpoint(self.enumerator_ptr)
+            default_endpoint_ptr = get_default_endpoint(self.enumerator_ptr, EDataFlow_eRender, ERole_eConsole)
             if default_endpoint_ptr:
-                if self.current_audio_volume_ptr:
-                    release_com_object(self.current_audio_volume_ptr)
-                    self.current_audio_volume_ptr = None
+                if self.current_output_audio_volume_ptr:
+                    release_com_object(self.current_output_audio_volume_ptr)
+                    self.current_output_audio_volume_ptr = None
                 
-                self.current_audio_volume_ptr = activate_audio_endpoint_volume(default_endpoint_ptr)
+                self.current_output_audio_volume_ptr = activate_audio_endpoint_volume(default_endpoint_ptr)
                 
-                current_volume_scalar = get_master_volume_scalar(self.current_audio_volume_ptr)
+                current_volume_scalar = get_master_volume_scalar(self.current_output_audio_volume_ptr)
                 current_volume_percent = int(current_volume_scalar * 100)
                 
-                self.volume_slider.blockSignals(True) 
-                self.volume_slider.setValue(current_volume_percent)
-                self.volume_slider.blockSignals(False)
+                self.output_volume_slider.blockSignals(True) 
+                self.output_volume_slider.setValue(current_volume_percent)
+                self.output_volume_slider.blockSignals(False)
                 
-                self.volume_label.setText(f"{current_volume_percent}%")
+                self.output_volume_label.setText(f"{current_volume_percent}%")
+
+                is_muted = get_mute(self.current_output_audio_volume_ptr)
+                self.output_mute_button.blockSignals(True)
+                self.output_mute_button.setChecked(is_muted)
+                self.output_mute_button.setIcon(get_icon("mute" if is_muted else "unmute", widget_style=self.style()))
+                self.output_mute_button.setText("Unmute Output" if is_muted else "Mute Output")
+                self.output_mute_button.blockSignals(False)
+
             else:
-                self.volume_slider.setValue(0)
-                self.volume_label.setText("N/A")
-                self.current_audio_volume_ptr = None
+                self.output_volume_slider.setValue(0)
+                self.output_volume_label.setText("N/A")
+                self.current_output_audio_volume_ptr = None
+                self.output_mute_button.blockSignals(True)
+                self.output_mute_button.setChecked(False)
+                self.output_mute_button.setIcon(get_icon("unmute", widget_style=self.style()))
+                self.output_mute_button.setText("Mute Output")
+                self.output_mute_button.blockSignals(False)
         except Exception as e:
-            print(f"Error updating volume from system: {e}")
-            self.volume_slider.setValue(0)
-            self.volume_label.setText("Error")
-            self.current_audio_volume_ptr = None
+            print(f"Error updating output volume from system: {e}")
+            self.output_volume_slider.setValue(0)
+            self.output_volume_label.setText("Error")
+            self.current_output_audio_volume_ptr = None
         finally:
             release_com_object(default_endpoint_ptr)
 
+    def toggle_output_mute_qt(self, checked):
+        if self.current_output_audio_volume_ptr:
+            set_mute(self.current_output_audio_volume_ptr, checked)
+            self.output_mute_button.setIcon(get_icon("mute" if checked else "unmute", widget_style=self.style()))
+            self.output_mute_button.setText("Unmute Output" if checked else "Mute Output")
+            self.update_output_volume_from_system_qt() # Refresh volume to ensure consistency
 
-    def populate_devices_qt(self):
+    def populate_output_devices_qt(self):
         # Clear existing device buttons and labels
-        for i in reversed(range(self.device_layout.count())):
-            widget_to_remove = self.device_layout.itemAt(i).widget()
+        for i in reversed(range(self.output_device_layout.count())):
+            widget_to_remove = self.output_device_layout.itemAt(i).widget()
             if widget_to_remove:
                 if isinstance(widget_to_remove, QAbstractButton):
-                    self.device_button_group.removeButton(widget_to_remove)
-                self.device_layout.removeWidget(widget_to_remove)
+                    self.output_device_button_group.removeButton(widget_to_remove)
+                self.output_device_layout.removeWidget(widget_to_remove)
                 widget_to_remove.deleteLater()
 
-        devices = enumerate_audio_endpoints(self.enumerator_ptr)
+        devices = enumerate_audio_endpoints(self.enumerator_ptr, EDataFlow_eRender)
         current_default_id = None
         default_endpoint_ptr_temp = None 
         try:
-            default_endpoint_ptr_temp = get_default_endpoint(self.enumerator_ptr)
+            default_endpoint_ptr_temp = get_default_endpoint(self.enumerator_ptr, EDataFlow_eRender, ERole_eConsole)
             if default_endpoint_ptr_temp:
                 current_default_id = get_device_id(default_endpoint_ptr_temp)
         except Exception as e:
-            print(f"Could not get current default device ID: {e}")
+            print(f"Could not get current default output device ID: {e}")
         finally:
             release_com_object(default_endpoint_ptr_temp)
 
-        self.device_button_group.blockSignals(True)
+        self.output_device_button_group.blockSignals(True)
 
         if devices:
-            headphone_icon = create_svg_icon(SVG_HEADPHONE_ICON)
+            headphone_icon = get_icon("headphone", widget_style=self.style())
             for device in devices:
                 radio_button = QRadioButton(device["name"])
                 radio_button.setProperty("device_id", device["id"])
                 radio_button.setProperty("device_ptr", device["ptr"])
                 radio_button.setIcon(headphone_icon)
-                self.device_layout.addWidget(radio_button)
-                self.device_button_group.addButton(radio_button)
+                self.output_device_layout.addWidget(radio_button)
+                self.output_device_button_group.addButton(radio_button)
 
                 if device["id"] == current_default_id:
                     radio_button.setChecked(True)
         else:
-            no_devices_label = QLabel("No active playback devices found.")
-            self.device_layout.addWidget(no_devices_label)
+            no_devices_label = QLabel("No active output devices found.")
+            self.output_device_layout.addWidget(no_devices_label)
 
-        self.device_button_group.blockSignals(False)
-
+        self.output_device_button_group.blockSignals(False)
 
     def change_audio_output_qt(self, button: QRadioButton, checked: bool):
         if checked:
             device_ptr_to_switch = button.property("device_ptr")
             if device_ptr_to_switch:
                 try:
-                    if switch_default_device(device_ptr_to_switch):
-                        if self.current_audio_volume_ptr:
-                            release_com_object(self.current_audio_volume_ptr)
-                            self.current_audio_volume_ptr = None
+                    if switch_default_device(device_ptr_to_switch, EDataFlow_eRender):
+                        if self.current_output_audio_volume_ptr:
+                            release_com_object(self.current_output_audio_volume_ptr)
+                            self.current_output_audio_volume_ptr = None
                         
                         new_default_endpoint_ptr = None
                         try:
-                            new_default_endpoint_ptr = get_default_endpoint(self.enumerator_ptr)
+                            new_default_endpoint_ptr = get_default_endpoint(self.enumerator_ptr, EDataFlow_eRender, ERole_eConsole)
                             if new_default_endpoint_ptr:
-                                self.current_audio_volume_ptr = activate_audio_endpoint_volume(new_default_endpoint_ptr)
-                                self.update_volume_from_system_qt()
+                                self.current_output_audio_volume_ptr = activate_audio_endpoint_volume(new_default_endpoint_ptr)
+                                self.update_output_volume_from_system_qt()
                         finally:
                             release_com_object(new_default_endpoint_ptr)
                         
-                        self.populate_devices_qt() 
+                        self.populate_output_devices_qt() 
                     else:
                         QMessageBox.warning(self, "Switch Failed", 
-                                             "Failed to set default audio device for any role.\n"
+                                             "Failed to set default audio output device for any role.\n"
                                              "This might require administrator privileges or the device may not support the default roles.")
-                        self.populate_devices_qt()
+                        self.populate_output_devices_qt()
                 except Exception as e:
-                    QMessageBox.critical(self, "Error", f"Failed to switch default device: {e}\n"
+                    QMessageBox.critical(self, "Error", f"Failed to switch default output device: {e}\n"
                                          "You might need to run the application as Administrator.")
-                    self.populate_devices_qt()
+                    self.populate_output_devices_qt()
 
+    # --- Input Device Control ---
+    def set_system_input_volume_qt(self, value: int):
+        """Sets system master volume for input from slider value (0-100)."""
+        if self.current_input_audio_volume_ptr:
+            set_master_volume_scalar(self.current_input_audio_volume_ptr, value / 100.0)
+            self.input_volume_label.setText(f"{value}%")
+
+    def update_input_volume_from_system_qt(self):
+        """Updates the input slider and label from actual system volume of the current default input device."""
+        default_endpoint_ptr = None
+        try:
+            default_endpoint_ptr = get_default_endpoint(self.enumerator_ptr, EDataFlow_eCapture, ERole_eCommunications)
+            if default_endpoint_ptr:
+                if self.current_input_audio_volume_ptr:
+                    release_com_object(self.current_input_audio_volume_ptr)
+                    self.current_input_audio_volume_ptr = None
+                
+                self.current_input_audio_volume_ptr = activate_audio_endpoint_volume(default_endpoint_ptr)
+                
+                current_volume_scalar = get_master_volume_scalar(self.current_input_audio_volume_ptr)
+                current_volume_percent = int(current_volume_scalar * 100)
+                
+                self.input_volume_slider.blockSignals(True) 
+                self.input_volume_slider.setValue(current_volume_percent)
+                self.input_volume_slider.blockSignals(False)
+                
+                self.input_volume_label.setText(f"{current_volume_percent}%")
+
+                is_muted = get_mute(self.current_input_audio_volume_ptr)
+                self.input_mute_button.blockSignals(True)
+                self.input_mute_button.setChecked(is_muted)
+                self.input_mute_button.setIcon(get_icon("mute" if is_muted else "unmute", widget_style=self.style()))
+                self.input_mute_button.setText("Unmute Input" if is_muted else "Mute Input")
+                self.input_mute_button.blockSignals(False)
+
+            else:
+                self.input_volume_slider.setValue(0)
+                self.input_volume_label.setText("N/A")
+                self.current_input_audio_volume_ptr = None
+                self.input_mute_button.blockSignals(True)
+                self.input_mute_button.setChecked(False)
+                self.input_mute_button.setIcon(get_icon("unmute", widget_style=self.style()))
+                self.input_mute_button.setText("Mute Input")
+                self.input_mute_button.blockSignals(False)
+        except Exception as e:
+            print(f"Error updating input volume from system: {e}")
+            self.input_volume_slider.setValue(0)
+            self.input_volume_label.setText("Error")
+            self.current_input_audio_volume_ptr = None
+        finally:
+            release_com_object(default_endpoint_ptr)
+
+    def toggle_input_mute_qt(self, checked):
+        if self.current_input_audio_volume_ptr:
+            set_mute(self.current_input_audio_volume_ptr, checked)
+            self.input_mute_button.setIcon(get_icon("mute" if checked else "unmute", widget_style=self.style()))
+            self.input_mute_button.setText("Unmute Input" if checked else "Mute Input")
+            self.update_input_volume_from_system_qt() # Refresh volume to ensure consistency
+
+    def populate_input_devices_qt(self):
+        # Clear existing device buttons and labels
+        for i in reversed(range(self.input_device_layout.count())):
+            widget_to_remove = self.input_device_layout.itemAt(i).widget()
+            if widget_to_remove:
+                if isinstance(widget_to_remove, QAbstractButton):
+                    self.input_device_button_group.removeButton(widget_to_remove)
+                self.input_device_layout.removeWidget(widget_to_remove)
+                widget_to_remove.deleteLater()
+
+        devices = enumerate_audio_endpoints(self.enumerator_ptr, EDataFlow_eCapture)
+        current_default_id = None
+        default_endpoint_ptr_temp = None 
+        try:
+            default_endpoint_ptr_temp = get_default_endpoint(self.enumerator_ptr, EDataFlow_eCapture, ERole_eCommunications)
+            if default_endpoint_ptr_temp:
+                current_default_id = get_device_id(default_endpoint_ptr_temp)
+        except Exception as e:
+            print(f"Could not get current default input device ID: {e}")
+        finally:
+            release_com_object(default_endpoint_ptr_temp)
+
+        self.input_device_button_group.blockSignals(True)
+
+        if devices:
+            microphone_icon = get_icon("microphone", widget_style=self.style())
+            for device in devices:
+                radio_button = QRadioButton(device["name"])
+                radio_button.setProperty("device_id", device["id"])
+                radio_button.setProperty("device_ptr", device["ptr"])
+                radio_button.setIcon(microphone_icon)
+                self.input_device_layout.addWidget(radio_button)
+                self.input_device_button_group.addButton(radio_button)
+
+                if device["id"] == current_default_id:
+                    radio_button.setChecked(True)
+        else:
+            no_devices_label = QLabel("No active input devices found.")
+            self.input_device_layout.addWidget(no_devices_label)
+
+        self.input_device_button_group.blockSignals(False)
+
+    def change_audio_input_qt(self, button: QRadioButton, checked: bool):
+        if checked:
+            device_ptr_to_switch = button.property("device_ptr")
+            if device_ptr_to_switch:
+                try:
+                    if switch_default_device(device_ptr_to_switch, EDataFlow_eCapture):
+                        if self.current_input_audio_volume_ptr:
+                            release_com_object(self.current_input_audio_volume_ptr)
+                            self.current_input_audio_volume_ptr = None
+                        
+                        new_default_endpoint_ptr = None
+                        try:
+                            new_default_endpoint_ptr = get_default_endpoint(self.enumerator_ptr, EDataFlow_eCapture, ERole_eCommunications)
+                            if new_default_endpoint_ptr:
+                                self.current_input_audio_volume_ptr = activate_audio_endpoint_volume(new_default_endpoint_ptr)
+                                self.update_input_volume_from_system_qt()
+                        finally:
+                            release_com_object(new_default_endpoint_ptr)
+                        
+                        self.populate_input_devices_qt() 
+                    else:
+                        QMessageBox.warning(self, "Switch Failed", 
+                                             "Failed to set default audio input device for any role.\n"
+                                             "This might require administrator privileges or the device may not support the default roles.")
+                        self.populate_input_devices_qt()
+                except Exception as e:
+                    QMessageBox.critical(self, "Error", f"Failed to switch default input device: {e}\n"
+                                         "You might need to run the application as Administrator.")
+                    self.populate_input_devices_qt()
 
     def eventFilter(self, obj, event):
         if obj == self and event.type() == QEvent.WindowDeactivate:
             self.hide()
         return super().eventFilter(obj, event)
+
+# --- New FloatingIcon Widget ---
+class FloatingIcon(QWidget):
+    clicked_to_show_widget = pyqtSignal() # Custom signal to notify parent to show volume widget
+
+    def __init__(self, icon_path, initial_x, initial_y, parent=None):
+        super().__init__(parent)
+        # Removed Qt.WindowStaysOnTopHint so it can go behind other windows
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool) 
+        self.setAttribute(Qt.WA_TranslucentBackground) # Make background transparent
+
+        self.icon_label = QLabel(self)
+        self.icon_label.setPixmap(QIcon(icon_path).pixmap(QSize(48, 48))) # Set icon size
+        self.icon_label.setAlignment(Qt.AlignCenter)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.icon_label)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.setLayout(layout)
+
+        self.setGeometry(initial_x, initial_y, 48, 48) # Set initial size and position
+
+        self.dragging = False
+        self.offset = QPoint()
+        self.click_pos = QPoint() # Store click position to differentiate click from drag
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.dragging = True
+            self.offset = event.pos()
+            self.click_pos = event.globalPos() # Store global position of click
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self.dragging:
+            self.move(self.mapToParent(event.pos() - self.offset))
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.dragging = False
+            # Check if the mouse moved significantly to differentiate drag from click
+            if (event.globalPos() - self.click_pos).manhattanLength() < QApplication.startDragDistance():
+                self.clicked_to_show_widget.emit()
+            event.accept()
+
+        app_instance = QApplication.instance()
+        if hasattr(app_instance, 'save_icon_position'):
+            app_instance.save_icon_position(self.x(), self.y())
+
 
 class SystemTrayApp(QApplication):
     def __init__(self, argv):
@@ -660,7 +991,7 @@ class SystemTrayApp(QApplication):
         self.setQuitOnLastWindowClosed(False)
 
         # Set Dark Mode Palette
-        self.setStyle("Fusion") # Recommended for dark themes
+        self.setStyle("Fusion")
         dark_palette = QPalette()
         dark_palette.setColor(QPalette.Window, QColor(53, 53, 53))
         dark_palette.setColor(QPalette.WindowText, Qt.white)
@@ -675,8 +1006,8 @@ class SystemTrayApp(QApplication):
         dark_palette.setColor(QPalette.Link, QColor(42, 130, 218))
         dark_palette.setColor(QPalette.Highlight, QColor(42, 130, 218))
         dark_palette.setColor(QPalette.HighlightedText, Qt.black)
-        dark_palette.setColor(QPalette.Disabled, QPalette.Text, QColor(128, 128, 128)) # Grey out disabled text
-        dark_palette.setColor(QPalette.Disabled, QPalette.ButtonText, QColor(128, 128, 128)) # Grey out disabled buttons
+        dark_palette.setColor(QPalette.Disabled, QPalette.Text, QColor(128, 128, 128))
+        dark_palette.setColor(QPalette.Disabled, QPalette.ButtonText, QColor(128, 128, 128))
         self.setPalette(dark_palette)
 
 
@@ -684,25 +1015,74 @@ class SystemTrayApp(QApplication):
         try:
             init_com()
             self.device_enumerator_ptr = create_device_enumerator()
-            self.initial_default_endpoint_ptr = get_default_endpoint(self.device_enumerator_ptr)
         except Exception as e:
             QMessageBox.critical(None, "Initialization Error", f"Failed to initialize audio system: {e}\n"
                                  "Please ensure your audio drivers are working and try running as Administrator.")
             sys.exit(1)
 
-        # Try to load icon from file, fall back if not found
+        # Load initial config
+        self.config_settings = load_config()
+        self.floating_widget_enabled = self.config_settings['toggle']
+        self.preferred_monitor_index = self.config_settings['monitor']
+        self.icon_x = self.config_settings['icon_x']
+        self.icon_y = self.config_settings['icon_y']
+
+        # Create the floating volume widget instance
+        self.floating_volume_widget = FloatingVolumeWidget(self.device_enumerator_ptr)
+        
+        # Create the draggable floating icon
+        self.floating_icon_widget = FloatingIcon(os.path.join(base_path, "outputcontrol_icon.ico"), 
+                                                 self.icon_x, self.icon_y)
+        self.floating_icon_widget.clicked_to_show_widget.connect(self.show_floating_widget_from_icon)
+
+
+        # Try to load tray icon from the bundled .ico file
         try:
-            # Load icon using the base_path for py2exe/PyInstaller compatibility
-            # This path logic is only relevant if using PyInstaller's --add-data
-            # For py2exe, if outputcontrol_icon.ico is in data_files, it will be in the root of the dist folder.
-            self.tray_icon = QSystemTrayIcon(QIcon("outputcontrol_icon.ico")) 
+            self.tray_icon = QSystemTrayIcon(QIcon(os.path.join(base_path, "outputcontrol_icon.ico")))
         except Exception:
-            self.tray_icon = QSystemTrayIcon(QIcon()) # Fallback to no icon or default
+            self.tray_icon = QSystemTrayIcon(QIcon())
             QMessageBox.warning(None, "Icon Missing", "outputcontrol_icon.ico not found. Please place it in the same directory or bundle correctly.")
             
         self.tray_icon.setToolTip("OutputControl")
 
+        # --- Tray Menu Setup ---
         menu = QMenu()
+
+        # Toggle Floating Widget Action
+        self.toggle_widget_action = QAction("Toggle Floating Icon", menu, checkable=True)
+        self.toggle_widget_action.setChecked(self.floating_widget_enabled)
+        self.toggle_widget_action.triggered.connect(self.toggle_floating_widget)
+        menu.addAction(self.toggle_widget_action)
+
+        # Monitor Selection Submenu
+        monitor_menu = QMenu("Select Monitor", menu)
+        
+        self.monitor_action_group = QActionGroup(self)
+        self.monitor_action_group.setExclusive(True)
+
+        desktop = QApplication.desktop()
+        num_screens = desktop.screenCount()
+        self.monitor_actions = []
+
+        for i in range(num_screens):
+            screen_name = f"Monitor {i + 1}"
+            screen_geometry = desktop.screenGeometry(i)
+            action = QAction(f"{screen_name} ({screen_geometry.width()}x{screen_geometry.height()})", monitor_menu, checkable=True)
+            action.setData(i + 1)
+            
+            action.triggered.connect(lambda checked, act=action: self.set_monitor(act.data()))
+            
+            monitor_menu.addAction(action)
+            self.monitor_action_group.addAction(action)
+            self.monitor_actions.append(action)
+
+            if (i + 1) == self.preferred_monitor_index:
+                action.setChecked(True)
+        
+        menu.addMenu(monitor_menu)
+        menu.addSeparator()
+
+        # Quit Action
         quit_action = QAction("Quit", menu)
         transparent_pixmap = QPixmap(1, 1)
         transparent_pixmap.fill(Qt.transparent)
@@ -714,40 +1094,168 @@ class SystemTrayApp(QApplication):
 
         self.tray_icon.activated.connect(self.tray_icon_activated)
 
-        self.volume_control_window = VolumeControlApp(self.device_enumerator_ptr, self.initial_default_endpoint_ptr)
-
         self.tray_icon.show()
+
+        # Show floating icon initially if enabled in config
+        if self.floating_widget_enabled:
+            self.floating_icon_widget.show()
+
+    # Helper method to save icon position from FloatingIcon
+    def save_icon_position(self, x, y):
+        self.icon_x = x
+        self.icon_y = y
+        save_config(self.floating_widget_enabled, self.preferred_monitor_index, self.icon_x, self.icon_y)
+
+    def toggle_floating_widget(self, checked):
+        self.floating_widget_enabled = checked
+        save_config(self.floating_widget_enabled, self.preferred_monitor_index, self.icon_x, self.icon_y)
+        if self.floating_widget_enabled:
+            self.floating_icon_widget.show()
+        else:
+            self.floating_icon_widget.hide()
+            self.floating_volume_widget.hide() # Also hide the volume widget if icon is disabled
+
+    def set_monitor(self, monitor_idx):
+        self.preferred_monitor_index = monitor_idx
+        save_config(self.floating_widget_enabled, self.preferred_monitor_index, self.icon_x, self.icon_y)
+        
+        # If floating icon is visible, reposition it relative to the new monitor
+        if self.floating_icon_widget.isVisible():
+            desktop = QApplication.desktop()
+            target_screen_index = self.preferred_monitor_index - 1
+            if not (0 <= target_screen_index < desktop.screenCount()):
+                target_screen_index = 0
+                self.preferred_monitor_index = 1
+                save_config(self.floating_widget_enabled, self.preferred_monitor_index, self.icon_x, self.icon_y)
+
+            screen_geometry = desktop.screenGeometry(target_screen_index)
+            
+            # Reposition the icon to a default spot on the new monitor
+            new_x = screen_geometry.x() + screen_geometry.width() - self.floating_icon_widget.width() - 50
+            new_y = screen_geometry.y() + screen_geometry.height() - self.floating_icon_widget.height() - 50
+            self.floating_icon_widget.move(new_x, new_y)
+            self.save_icon_position(new_x, new_y)
+
+        if self.floating_volume_widget.isVisible():
+            # If the volume widget is already visible, reposition it based on the new monitor setting
+            # This call will use the floating icon's position as reference
+            self.show_floating_widget_from_icon() 
 
     def tray_icon_activated(self, reason):
         if reason == QSystemTrayIcon.Trigger:
-            self.show_volume_control_at_cursor()
+            # When tray icon is left-clicked, show the volume widget on the current cursor's monitor.
+            self.show_floating_widget_from_tray_click()
+        elif reason == QSystemTrayIcon.Context:
+            pass # Context menu is handled by setContextMenu
 
-    def show_volume_control_at_cursor(self):
-        self.volume_control_window.refresh_ui()
+    def show_floating_widget_from_icon(self):
+        """
+        Shows the FloatingVolumeWidget, positioned relative to the FloatingIcon.
+        This method is triggered by the FloatingIcon's clicked_to_show_widget signal.
+        """
+        self.floating_volume_widget.refresh_ui()
 
-        cursor_pos = self.tray_icon.geometry().center()
+        icon_rect = self.floating_icon_widget.geometry()
+        
+        # Calculate dynamic height based on number of devices
+        num_output_devices = len(enumerate_audio_endpoints(self.device_enumerator_ptr, EDataFlow_eRender))
+        num_input_devices = len(enumerate_audio_endpoints(self.device_enumerator_ptr, EDataFlow_eCapture))
+        
+        device_item_height = 25 
+        base_widget_height = 180 
+        window_height = base_widget_height + (num_output_devices * device_item_height) + (num_input_devices * device_item_height)
+        window_width = 280 
 
         desktop = QApplication.desktop()
-        screen_number = desktop.screenNumber(cursor_pos)
-        screen_geometry = desktop.screenGeometry(screen_number)
+        current_screen_index = desktop.screenNumber(icon_rect.center())
+        screen_available_geometry = desktop.availableGeometry(current_screen_index)
 
-        window_width = 280 
+        # Determine if the icon is on the left or right half of the available screen
+        screen_center_x = screen_available_geometry.x() + screen_available_geometry.width() / 2
+
+        # Initial positioning attempts
+        # Try right first if icon is on left half, or left if icon is on right half
+        if icon_rect.center().x() < screen_center_x:
+            # Icon is on the left half, try to display widget to the right
+            target_x = icon_rect.right() + 5
+            target_y = icon_rect.center().y() - window_height // 2
+            
+            # Check if it fits to the right
+            if (target_x + window_width > screen_available_geometry.right() and
+                icon_rect.left() - window_width - 5 >= screen_available_geometry.left()):
+                # If it doesn't fit right, try left
+                target_x = icon_rect.left() - window_width - 5
+        else:
+            # Icon is on the right half, try to display widget to the left
+            target_x = icon_rect.left() - window_width - 110
+            target_y = icon_rect.center().y() - window_height // 2
+
+            # Check if it fits to the left
+            if (target_x < screen_available_geometry.left() and
+                icon_rect.right() + 5 + window_width <= screen_available_geometry.right()):
+                # If it doesn't fit left, try right
+                target_x = icon_rect.right() + 5
         
-        num_devices = len(enumerate_audio_endpoints(self.device_enumerator_ptr)) 
-        
-        window_height = 110 + (num_devices * 25) + 20 
-        if window_height < 180:
-            window_height = 180
+        target_y = target_y - 250
 
-        # Position the window near the tray icon (bottom-right corner of the screen)
-        x = screen_geometry.x() + screen_geometry.width() - window_width - 100
-        y = screen_geometry.y() + screen_geometry.height() - window_height - 65
+        # Ensure Y position is within bounds, adjusting if necessary
+        if target_y < screen_available_geometry.top():
+            target_y = screen_available_geometry.top()
+        elif target_y + window_height > screen_available_geometry.bottom():
+            target_y = screen_available_geometry.bottom() - window_height
 
-        self.volume_control_window.setGeometry(x, y, window_width, window_height)
+        self.floating_volume_widget.setGeometry(target_x, target_y, window_width, window_height)
 
-        self.volume_control_window.show()
-        self.volume_control_window.activateWindow()
-        self.volume_control_window.raise_()
+        self.floating_volume_widget.show()
+        self.floating_volume_widget.activateWindow()
+        self.floating_volume_widget.raise_()
+
+    def show_floating_widget_from_tray_click(self):
+        """
+        Shows the FloatingVolumeWidget, positioned centered horizontally on the mouse
+        and with its bottom edge above the mouse, ensuring it appears above the taskbar.
+        """
+        self.floating_volume_widget.refresh_ui()
+
+        desktop = QApplication.desktop()
+        cursor_pos = QCursor.pos() # Get current mouse cursor global position
+        current_screen_index = desktop.screenNumber(cursor_pos)
+        screen_available_geometry = desktop.availableGeometry(current_screen_index)
+
+        window_width = 280
+        num_output_devices = len(enumerate_audio_endpoints(self.device_enumerator_ptr, EDataFlow_eRender))
+        num_input_devices = len(enumerate_audio_endpoints(self.device_enumerator_ptr, EDataFlow_eCapture))
+        device_item_height = 25
+        base_widget_height = 180
+        window_height = base_widget_height + (num_output_devices * device_item_height) + (num_input_devices * device_item_height)
+
+        # Fixed offset from the right edge of the available screen area
+        # This will make it appear "further to the left" of the cursor's general area
+        # Adjust 100 as needed to move it further left or right
+        x_offset_from_right_edge = 200 
+        target_x = screen_available_geometry.right() - window_width - x_offset_from_right_edge
+
+        # Fixed offset from the bottom edge of the available screen area (above taskbar)
+        # Adjust 10 as needed for "further up" or down
+        y_offset_from_bottom_edge = 75
+        target_y = screen_available_geometry.bottom() - window_height - y_offset_from_bottom_edge
+
+        # Boundary checks for x-position
+        if target_x < screen_available_geometry.left():
+            target_x = screen_available_geometry.left()
+        elif target_x + window_width > screen_available_geometry.right():
+            target_x = screen_available_geometry.right() - window_width
+
+        # Boundary checks for y-position (already handled by fixed position relative to bottom)
+        if target_y < screen_available_geometry.top():
+            target_y = screen_available_geometry.top()
+
+        self.floating_volume_widget.setGeometry(target_x, target_y, window_width, window_height)
+
+        self.floating_volume_widget.show()
+        self.floating_volume_widget.activateWindow()
+        self.floating_volume_widget.raise_()
+
 
 if __name__ == "__main__":
     app = SystemTrayApp(sys.argv)
