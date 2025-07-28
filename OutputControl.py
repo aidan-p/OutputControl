@@ -8,7 +8,7 @@ from ctypes import POINTER, byref, c_void_p, c_ulong, c_int, c_wchar_p, c_uint
 from PyQt5.QtWidgets import (QApplication, QSystemTrayIcon, QMenu,
                              QAction, QSlider, QWidget, QVBoxLayout, QLabel, QHBoxLayout,
                              QDesktopWidget, QRadioButton, QButtonGroup, QMessageBox, QAbstractButton,
-                             QPushButton, QSizePolicy, QSpacerItem, QFrame, QActionGroup, QStyle) # QStyle imported
+                             QPushButton, QSizePolicy, QSpacerItem, QFrame, QActionGroup, QStyle)
 from PyQt5.QtGui import QIcon, QPixmap, QPalette, QColor
 from PyQt5.QtCore import Qt, QPoint, QEvent, QSize, QTimer, pyqtSignal
 
@@ -32,7 +32,8 @@ def load_config():
         'toggle': True, # Default: widget enabled
         'monitor': 1,    # Default: monitor 1
         'icon_x': 0,     # Default: icon X position
-        'icon_y': 0      # Default: icon Y position
+        'icon_y': 0,      # Default: icon Y position
+        'icon_size': 48  # Default: icon size (48x48)
     }
 
     if 'WidgetDisplay' in config:
@@ -53,15 +54,21 @@ def load_config():
                 settings['icon_y'] = config['WidgetDisplay'].getint('icon_y')
             except ValueError:
                 pass
+        if 'icon_size' in config['WidgetDisplay']:
+            try:
+                settings['icon_size'] = config['WidgetDisplay'].getint('icon_size')
+            except ValueError:
+                pass
     return settings
 
-def save_config(toggle_state, monitor_index, icon_x, icon_y):
+def save_config(toggle_state, monitor_index, icon_x, icon_y, icon_size):
     config = configparser.ConfigParser()
     config['WidgetDisplay'] = {
         'toggle': str(toggle_state),
         'monitor': str(monitor_index),
         'icon_x': str(icon_x),
-        'icon_y': str(icon_y)
+        'icon_y': str(icon_y),
+        'icon_size': str(icon_size)
     }
     with open(CONFIG_FILE, 'w') as configfile:
         config.write(configfile)
@@ -549,7 +556,7 @@ def get_icon(icon_type, size=QSize(20, 20), widget_style=None):
         # Using SP_MediaVolume as a general audio output icon
         return widget_style.standardIcon(QStyle.SP_MediaVolume)
     elif icon_type == "microphone":
-        # Using SP_MediaVolumeMuted as a general audio input icon (or to differentiate)
+        # Using SP_MediaPlay as a general audio input icon (or to differentiate)
         return widget_style.standardIcon(QStyle.SP_MediaPlay)
     else:
         return QIcon() # Return empty icon for unknown type
@@ -939,14 +946,22 @@ class FloatingVolumeWidget(QWidget):
 class FloatingIcon(QWidget):
     clicked_to_show_widget = pyqtSignal() # Custom signal to notify parent to show volume widget
 
-    def __init__(self, icon_path, initial_x, initial_y, parent=None):
+    def update_icon_pixmap(self):
+        """Updates the pixmap of the icon_label based on current_icon_size."""
+        self.icon_label.setPixmap(QIcon(self.icon_path).pixmap(QSize(self.current_icon_size, self.current_icon_size)))
+        self.setFixedSize(self.current_icon_size, self.current_icon_size) # Update widget size
+
+    def __init__(self, icon_path, initial_x, initial_y, icon_size, parent=None): # Added icon_size
         super().__init__(parent)
         # Removed Qt.WindowStaysOnTopHint so it can go behind other windows
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool) 
         self.setAttribute(Qt.WA_TranslucentBackground) # Make background transparent
 
+        self.icon_path = icon_path # Store icon path to re-apply on size change
+        self.current_icon_size = icon_size # Store current icon size
+
         self.icon_label = QLabel(self)
-        self.icon_label.setPixmap(QIcon(icon_path).pixmap(QSize(48, 48))) # Set icon size
+        self.update_icon_pixmap() # Call a method to set pixmap based on size
         self.icon_label.setAlignment(Qt.AlignCenter)
 
         layout = QVBoxLayout(self)
@@ -954,11 +969,27 @@ class FloatingIcon(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         self.setLayout(layout)
 
-        self.setGeometry(initial_x, initial_y, 48, 48) # Set initial size and position
+        self.setGeometry(initial_x, initial_y, icon_size, icon_size) # Set initial size and position
 
         self.dragging = False
         self.offset = QPoint()
         self.click_pos = QPoint() # Store click position to differentiate click from drag
+
+    def set_size(self, new_size):
+        """Sets a new size for the icon and updates its pixmap."""
+        if self.current_icon_size != new_size:
+            self.current_icon_size = new_size
+            self.update_icon_pixmap()
+            # Reposition the icon to avoid jumping too much, try to keep its center
+            current_center = self.geometry().center()
+            new_x = current_center.x() - new_size // 2
+            new_y = current_center.y() - new_size // 2
+            self.move(new_x, new_y)
+            
+            app_instance = QApplication.instance()
+            if hasattr(app_instance, 'save_icon_position'):
+                app_instance.save_icon_position(self.x(), self.y()) # Save new position after resize
+
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -1026,13 +1057,14 @@ class SystemTrayApp(QApplication):
         self.preferred_monitor_index = self.config_settings['monitor']
         self.icon_x = self.config_settings['icon_x']
         self.icon_y = self.config_settings['icon_y']
+        self.icon_size = self.config_settings['icon_size'] # Load icon size
 
         # Create the floating volume widget instance
         self.floating_volume_widget = FloatingVolumeWidget(self.device_enumerator_ptr)
         
         # Create the draggable floating icon
         self.floating_icon_widget = FloatingIcon(os.path.join(base_path, "outputcontrol_icon.ico"), 
-                                                 self.icon_x, self.icon_y)
+                                                 self.icon_x, self.icon_y, self.icon_size) # Pass icon_size
         self.floating_icon_widget.clicked_to_show_widget.connect(self.show_floating_widget_from_icon)
 
 
@@ -1053,6 +1085,23 @@ class SystemTrayApp(QApplication):
         self.toggle_widget_action.setChecked(self.floating_widget_enabled)
         self.toggle_widget_action.triggered.connect(self.toggle_floating_widget)
         menu.addAction(self.toggle_widget_action)
+
+        # Icon Size Submenu
+        icon_size_menu = QMenu("Icon Size", menu)
+        self.icon_size_action_group = QActionGroup(self)
+        self.icon_size_action_group.setExclusive(True)
+
+        sizes = {"Small": 32, "Medium": 48, "Large": 64}
+        for name, size in sizes.items():
+            action = QAction(name, icon_size_menu, checkable=True)
+            action.setData(size)
+            action.triggered.connect(lambda checked, s=size: self.set_icon_size(s))
+            icon_size_menu.addAction(action)
+            self.icon_size_action_group.addAction(action)
+            if size == self.icon_size:
+                action.setChecked(True)
+        menu.addMenu(icon_size_menu)
+        menu.addSeparator()
 
         # Monitor Selection Submenu
         monitor_menu = QMenu("Select Monitor", menu)
@@ -1096,28 +1145,61 @@ class SystemTrayApp(QApplication):
 
         self.tray_icon.show()
 
+        # Connect cleanup method to application quit signal
+        self.aboutToQuit.connect(self._cleanup_com)
+
         # Show floating icon initially if enabled in config
         if self.floating_widget_enabled:
             self.floating_icon_widget.show()
+
+    def _cleanup_com(self):
+        """
+        Releases the main COM enumerator and explicitly deletes top-level widgets.
+        This method is called when the application is about to quit.
+        """
+        print("Cleaning up COM objects and widgets...")
+        if self.device_enumerator_ptr:
+            release_com_object(self.device_enumerator_ptr)
+            self.device_enumerator_ptr = None
+            print("Released device enumerator COM object.")
+        
+        # Explicitly delete top-level widgets.
+        # While QApplication's destructor usually handles this, explicit calls
+        # can prevent subtle issues in complex shutdown scenarios.
+        if self.floating_volume_widget:
+            self.floating_volume_widget.deleteLater()
+            self.floating_volume_widget = None
+            print("Scheduled FloatingVolumeWidget for deletion.")
+        
+        if self.floating_icon_widget:
+            self.floating_icon_widget.deleteLater()
+            self.floating_icon_widget = None
+            print("Scheduled FloatingIcon for deletion.")
+
 
     # Helper method to save icon position from FloatingIcon
     def save_icon_position(self, x, y):
         self.icon_x = x
         self.icon_y = y
-        save_config(self.floating_widget_enabled, self.preferred_monitor_index, self.icon_x, self.icon_y)
+        save_config(self.floating_widget_enabled, self.preferred_monitor_index, self.icon_x, self.icon_y, self.icon_size)
 
     def toggle_floating_widget(self, checked):
         self.floating_widget_enabled = checked
-        save_config(self.floating_widget_enabled, self.preferred_monitor_index, self.icon_x, self.icon_y)
+        save_config(self.floating_widget_enabled, self.preferred_monitor_index, self.icon_x, self.icon_y, self.icon_size)
         if self.floating_widget_enabled:
             self.floating_icon_widget.show()
         else:
             self.floating_icon_widget.hide()
             self.floating_volume_widget.hide() # Also hide the volume widget if icon is disabled
 
+    def set_icon_size(self, size):
+        self.icon_size = size
+        self.floating_icon_widget.set_size(size) # Update the floating icon widget's size
+        save_config(self.floating_widget_enabled, self.preferred_monitor_index, self.icon_x, self.icon_y, self.icon_size)
+
     def set_monitor(self, monitor_idx):
         self.preferred_monitor_index = monitor_idx
-        save_config(self.floating_widget_enabled, self.preferred_monitor_index, self.icon_x, self.icon_y)
+        save_config(self.floating_widget_enabled, self.preferred_monitor_index, self.icon_x, self.icon_y, self.icon_size)
         
         # If floating icon is visible, reposition it relative to the new monitor
         if self.floating_icon_widget.isVisible():
@@ -1126,7 +1208,7 @@ class SystemTrayApp(QApplication):
             if not (0 <= target_screen_index < desktop.screenCount()):
                 target_screen_index = 0
                 self.preferred_monitor_index = 1
-                save_config(self.floating_widget_enabled, self.preferred_monitor_index, self.icon_x, self.icon_y)
+                save_config(self.floating_widget_enabled, self.preferred_monitor_index, self.icon_x, self.icon_y, self.icon_size)
 
             screen_geometry = desktop.screenGeometry(target_screen_index)
             
@@ -1232,7 +1314,7 @@ class SystemTrayApp(QApplication):
         # Fixed offset from the right edge of the available screen area
         # This will make it appear "further to the left" of the cursor's general area
         # Adjust 100 as needed to move it further left or right
-        x_offset_from_right_edge = 200 
+        x_offset_from_right_edge = 200
         target_x = screen_available_geometry.right() - window_width - x_offset_from_right_edge
 
         # Fixed offset from the bottom edge of the available screen area (above taskbar)
