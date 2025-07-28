@@ -18,6 +18,6 @@
 - OPTIONAL: Add shortcut to startup
 
 ## Building
-- If you would like to build the program yourself, download the repo and run the following command while inside the directory:
+- If you would like to build the program yourself, download the repo, install Nuitka from the official website, and run the following command while inside the directory:
 ```batch
 py -3.12 -m nuitka --mingw64 --enable-plugin=pyqt5 --standalone --onefile --windows-console-mode=disable --windows-icon-from-ico=outputcontrol_icon.ico --include-data-files=outputcontrol_icon.png=outputcontrol_icon.png --include-data-files=config.ini=config.ini OutputControl.py
