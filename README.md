@@ -19,4 +19,5 @@
 
 ## Building
 - If you would like to build the program yourself, download the repo and run the following command while inside the directory:
-```py -3.12 -m nuitka --mingw64 --enable-plugin=pyqt5 --standalone --onefile --windows-console-mode=disable --windows-icon-from-ico=outputcontrol_icon.ico --include-data-files=outputcontrol_icon.png=outputcontrol_icon.png --include-data-files=config.ini=config.ini OutputControl.py
+```batch
+py -3.12 -m nuitka --mingw64 --enable-plugin=pyqt5 --standalone --onefile --windows-console-mode=disable --windows-icon-from-ico=outputcontrol_icon.ico --include-data-files=outputcontrol_icon.png=outputcontrol_icon.png --include-data-files=config.ini=config.ini OutputControl.py
