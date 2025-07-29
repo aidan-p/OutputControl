@@ -662,7 +662,7 @@ class FloatingVolumeWidget(QWidget):
         # Timer to periodically refresh volume and device list
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self.refresh_ui)
-        self.refresh_timer.start(1000)
+        self.refresh_timer.start(5000)
 
         # Initial population on startup
         self.refresh_ui() # Call refresh_ui once to populate everything
