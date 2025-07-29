@@ -124,7 +124,6 @@ IID_IMMDeviceEnumerator   = create_guid("A95664D2-9614-4F35-A746-DE8DB63617E6")
 IID_IAudioEndpointVolume  = create_guid("5CDF2C82-841E-4546-9722-0CF74078229A")
 
 # For switching default device, we use the undocumented IPolicyConfig interface.
-# These GUIDs are commonly used in the community.
 CLSID_CPolicyConfigClient = create_guid("870AF99C-171D-4F9E-AF0D-E63DF40C2BC9")
 IID_IPolicyConfig         = create_guid("F8679F50-850A-41CF-9C72-430F290290C8") 
 
@@ -137,7 +136,6 @@ class PROPERTYKEY(ctypes.Structure):
         ("pid", ctypes.c_ulong)
     ]
 
-# For our purposes we only handle VT_LPWSTR (VT value 31)
 VT_LPWSTR = 31
 
 class PROPVARIANT(ctypes.Structure):
@@ -209,8 +207,7 @@ def get_default_endpoint(enumerator_ptr, data_flow: int, role: int):
         byref(default_endpoint)
     )
     if hr < 0:
-        # print(f"GetDefaultAudioEndpoint failed for data_flow={data_flow}, role={role}: {ctypes.WinError(hr)}")
-        return None # Return None if no default endpoint found or error
+        return None
     return default_endpoint
 
 # ============================================================
@@ -348,7 +345,7 @@ class IPropertyStoreVtbl(ctypes.Structure):
 class IPropertyStore_Interface(ctypes.Structure):
     _fields_ = [("lpVtbl", POINTER(IPropertyStoreVtbl))]
 
-# Helper to release COM objects (defined once at the top)
+# Helper to release COM objects
 def release_com_object(ptr):
     if ptr and ptr.value:
         try:
@@ -421,14 +418,12 @@ def enumerate_audio_endpoints(enumerator_ptr, data_flow: int):
             byref(pCollection)
         )
         if hr < 0:
-            # print(f"EnumAudioEndpoints failed for data_flow={data_flow}: {ctypes.WinError(hr)}")
             return [] # Return empty list if no devices found or error
         
         collection_iface = ctypes.cast(pCollection, POINTER(IMMDeviceCollection_Interface))
         count = c_uint()
         hr = collection_iface.contents.lpVtbl.contents.GetCount(collection_iface, byref(count))
         if hr < 0:
-            # print(f"GetCount failed for data_flow={data_flow}: {ctypes.WinError(hr)}")
             return []
         
         for i in range(count.value):
@@ -443,13 +438,11 @@ def enumerate_audio_endpoints(enumerator_ptr, data_flow: int):
                 device_id = get_device_id(pDevice)
                 devices.append({"ptr": pDevice, "name": name, "id": device_id})
             except Exception as e:
-                # print(f"Error processing device {i} for data_flow={data_flow}: {e}")
                 release_com_object(pDevice)
                 pass
     finally:
         release_com_object(pCollection)
     
-    devices.reverse() # Often preferred for display order
     return devices
 
 # ============================================================
@@ -516,7 +509,6 @@ def switch_default_device(device_ptr, data_flow: int):
             hr = policy_config.contents.lpVtbl.contents.SetDefaultEndpoint(policy_config, device_id, role)
             if hr < 0:
                 if hr == -2147023163:
-                    # print(f"SetDefaultEndpoint for role {role} failed with 'The tag is invalid' (expected for some roles/devices).")
                     pass
                 else:
                     print(f"SetDefaultEndpoint for data_flow={data_flow}, role {role} failed with unexpected error: {ctypes.WinError(hr)}")
@@ -553,10 +545,8 @@ def get_icon(icon_type, size=QSize(20, 20), widget_style=None):
     elif icon_type == "unmute":
         return widget_style.standardIcon(QStyle.SP_MediaVolume)
     elif icon_type == "headphone":
-        # Using SP_MediaVolume as a general audio output icon
         return widget_style.standardIcon(QStyle.SP_MediaVolume)
     elif icon_type == "microphone":
-        # Using SP_MediaPlay as a general audio input icon (or to differentiate)
         return widget_style.standardIcon(QStyle.SP_MediaPlay)
     else:
         return QIcon() # Return empty icon for unknown type
@@ -659,13 +649,64 @@ class FloatingVolumeWidget(QWidget):
         self.setLayout(main_layout)
         self.installEventFilter(self)
 
-        # Timer to periodically refresh volume and device list
-        self.refresh_timer = QTimer(self)
-        self.refresh_timer.timeout.connect(self.refresh_ui)
-        self.refresh_timer.start(5000)
-
-        # Initial population on startup
         self.refresh_ui() # Call refresh_ui once to populate everything
+
+    def __del__(self):
+        # Ensure any remaining COM objects are released, though eventFilter should handle this
+        if self.current_output_audio_volume_ptr:
+            release_com_object(self.current_output_audio_volume_ptr)
+            self.current_output_audio_volume_ptr = None
+        if self.current_input_audio_volume_ptr:
+            release_com_object(self.current_input_audio_volume_ptr)
+            self.current_input_audio_volume_ptr = None
+        
+        # Clear output device buttons and release their COM pointers
+        for i in reversed(range(self.output_device_layout.count())):
+            widget = self.output_device_layout.itemAt(i).widget()
+            if widget:
+                if isinstance(widget, QRadioButton):
+                    device_ptr = widget.property("device_ptr")
+                    if device_ptr:
+                        release_com_object(device_ptr)
+                        widget.setProperty("device_ptr", None) # Clear the property
+                widget.deleteLater()
+        
+        # Clear input device buttons and release their COM pointers
+        for i in reversed(range(self.input_device_layout.count())):
+            widget = self.input_device_layout.itemAt(i).widget()
+            if widget:
+                if isinstance(widget, QRadioButton):
+                    device_ptr = widget.property("device_ptr")
+                    if device_ptr:
+                        release_com_object(device_ptr)
+                        widget.setProperty("device_ptr", None) # Clear the property
+                widget.deleteLater()
+
+        if self.output_device_button_group:
+            self.output_device_button_group.setParent(None)
+            self.output_device_button_group = None
+        if self.input_device_button_group:
+            self.input_device_button_group.setParent(None)
+            self.input_device_button_group = None
+
+        # Clear direct references to widgets and layouts
+        self.output_volume_slider = None
+        self.output_volume_label = None
+        self.output_mute_button = None
+        self.output_device_layout = None # Clear layout reference
+        
+        self.input_volume_slider = None
+        self.input_volume_label = None
+        self.input_mute_button = None
+        self.input_device_layout = None # Clear layout reference
+
+    def showEvent(self, event):
+        """Called when the widget is shown."""
+        super().showEvent(event)
+
+    def hideEvent(self, event):
+        """Called when the widget is hidden."""
+        super().hideEvent(event)
 
     def refresh_ui(self):
         """Refreshes both output and input device lists and volume statuses."""
@@ -732,16 +773,25 @@ class FloatingVolumeWidget(QWidget):
             set_mute(self.current_output_audio_volume_ptr, checked)
             self.output_mute_button.setIcon(get_icon("mute" if checked else "unmute", widget_style=self.style()))
             self.output_mute_button.setText("Unmute Output" if checked else "Mute Output")
-            self.update_output_volume_from_system_qt() # Refresh volume to ensure consistency
+            self.update_output_volume_from_system_qt()
 
     def populate_output_devices_qt(self):
-        # Clear existing device buttons and labels
         for i in reversed(range(self.output_device_layout.count())):
-            widget_to_remove = self.output_device_layout.itemAt(i).widget()
+            item = self.output_device_layout.itemAt(i)
+            widget_to_remove = item.widget()
             if widget_to_remove:
+                # IMPORTANT: Release the COM pointer before deleting the widget
+                if isinstance(widget_to_remove, QRadioButton):
+                    device_ptr = widget_to_remove.property("device_ptr")
+                    if device_ptr:
+                        release_com_object(device_ptr)
+                        widget_to_remove.setProperty("device_ptr", None)
+                
                 if isinstance(widget_to_remove, QAbstractButton):
                     self.output_device_button_group.removeButton(widget_to_remove)
-                self.output_device_layout.removeWidget(widget_to_remove)
+                
+                self.output_device_layout.removeItem(item) # Remove the layout item
+                widget_to_remove.setParent(None) # Detach from parent
                 widget_to_remove.deleteLater()
 
         devices = enumerate_audio_endpoints(self.enumerator_ptr, EDataFlow_eRender)
@@ -868,11 +918,21 @@ class FloatingVolumeWidget(QWidget):
     def populate_input_devices_qt(self):
         # Clear existing device buttons and labels
         for i in reversed(range(self.input_device_layout.count())):
-            widget_to_remove = self.input_device_layout.itemAt(i).widget()
+            item = self.input_device_layout.itemAt(i)
+            widget_to_remove = item.widget()
             if widget_to_remove:
+                # IMPORTANT: Release the COM pointer before deleting the widget
+                if isinstance(widget_to_remove, QRadioButton):
+                    device_ptr = widget_to_remove.property("device_ptr")
+                    if device_ptr:
+                        release_com_object(device_ptr)
+                        widget_to_remove.setProperty("device_ptr", None)
+                
                 if isinstance(widget_to_remove, QAbstractButton):
                     self.input_device_button_group.removeButton(widget_to_remove)
-                self.input_device_layout.removeWidget(widget_to_remove)
+                
+                self.input_device_layout.removeItem(item)
+                widget_to_remove.setParent(None)
                 widget_to_remove.deleteLater()
 
         devices = enumerate_audio_endpoints(self.enumerator_ptr, EDataFlow_eCapture)
@@ -961,7 +1021,7 @@ class FloatingIcon(QWidget):
         self.current_icon_size = icon_size # Store current icon size
 
         self.icon_label = QLabel(self)
-        self.update_icon_pixmap() # Call a method to set pixmap based on size
+        self.update_icon_pixmap()
         self.icon_label.setAlignment(Qt.AlignCenter)
 
         layout = QVBoxLayout(self)
@@ -1158,23 +1218,26 @@ class SystemTrayApp(QApplication):
         This method is called when the application is about to quit.
         """
         print("Cleaning up COM objects and widgets...")
+
         if self.device_enumerator_ptr:
             release_com_object(self.device_enumerator_ptr)
             self.device_enumerator_ptr = None
             print("Released device enumerator COM object.")
-        
-        # Explicitly delete top-level widgets.
-        # While QApplication's destructor usually handles this, explicit calls
-        # can prevent subtle issues in complex shutdown scenarios.
+
         if self.floating_volume_widget:
+            if self.floating_volume_widget.isVisible():
+                self.floating_volume_widget.close()
             self.floating_volume_widget.deleteLater()
             self.floating_volume_widget = None
             print("Scheduled FloatingVolumeWidget for deletion.")
-        
+
         if self.floating_icon_widget:
+            if self.floating_icon_widget.isVisible():
+                self.floating_icon_widget.close()
             self.floating_icon_widget.deleteLater()
             self.floating_icon_widget = None
             print("Scheduled FloatingIcon for deletion.")
+
 
 
     # Helper method to save icon position from FloatingIcon
@@ -1219,8 +1282,6 @@ class SystemTrayApp(QApplication):
             self.save_icon_position(new_x, new_y)
 
         if self.floating_volume_widget.isVisible():
-            # If the volume widget is already visible, reposition it based on the new monitor setting
-            # This call will use the floating icon's position as reference
             self.show_floating_widget_from_icon() 
 
     def tray_icon_activated(self, reason):
@@ -1313,12 +1374,10 @@ class SystemTrayApp(QApplication):
 
         # Fixed offset from the right edge of the available screen area
         # This will make it appear "further to the left" of the cursor's general area
-        # Adjust 100 as needed to move it further left or right
         x_offset_from_right_edge = 200
         target_x = screen_available_geometry.right() - window_width - x_offset_from_right_edge
 
         # Fixed offset from the bottom edge of the available screen area (above taskbar)
-        # Adjust 10 as needed for "further up" or down
         y_offset_from_bottom_edge = 75
         target_y = screen_available_geometry.bottom() - window_height - y_offset_from_bottom_edge
 
